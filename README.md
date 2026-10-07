@@ -41,6 +41,19 @@ docker compose up --build
 - **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件、支承点停用/启用）
   版本 +1；试载记录当时版本，图一变旧试载即失效。临时支撑的搭设/卸除不影响版本。
 - **改接限制**：安装连接只允许使用事先登记的端点组合（`POST /connections` 登记的 id）。
+- **连续传力保护**：施工中可经 `protect` 工序把一个**已在位且当前仅凭在位永久连接
+  即可抵达某个在用固定支承点**的构件列为连续传力保护对象（临时支撑不能替代永久
+  路径，否则 409 `protect_unreachable`），之后经 `unprotect` 工序解除。保护、解除
+  都是普通工序（占用连续工序号），也可列入预案清单走预演/确认；保护状态持久保存
+  于 SQLite（旧库启动自动建空表，默认无保护对象），`/state` 以顶层 `protections`
+  列表与各构件的 `protected` 字段展示。保护期间：**不得拆卸该构件**（409
+  `protected`，须先解除）；每道后续工序结束时它都须**仅凭当时在位的永久连接**
+  抵达某个在用支承点——**即使临时支撑仍能承重**，拆掉其唯一永久路径或停用其唯一
+  在用支承点，仍按原有 409 `unreachable` 语义指出首个受影响构件、整步不留改动；
+  正确做法是**先接通备用永久路径（改接）后再拆旧路**。其他构件仍按原施工期规则
+  （连接或临时支撑）检查。保护/解除不递增连接状态版本、不使试载失效，但纳入预案
+  凭据指纹——预演后的保护变化使旧凭据失效（409 `plan_stale`）；快照附 `protections`
+  字段固化当时保护对象。
 - **整步拒绝**：跳号、端点不在位、可达性或卸撑条件不满足时返回 409，
   响应含 `first_affected_component`（首个受影响构件），已有回执与状态不变。
 - **施工预案（预演 / 确认）**：`POST /plan/preview` 按现有单步字段提交从末条回执后
@@ -69,11 +82,11 @@ docker compose up --build
 | POST | `/replacements` | 登记替换件 `{id, name, min_load}`（初始不在位） |
 | POST | `/connections` | 登记榫卯连接 `{id, a, b, in_place?}`（默认 true；改接预留组合传 false） |
 | POST | `/temp-supports` | 登记临时支撑 `{id, a, b, in_place?}`（默认 false） |
-| POST | `/steps` | 提交工序回执（含支承点停用/启用，见下） |
+| POST | `/steps` | 提交工序回执（含支承点停用/启用、连续传力保护/解除，见下） |
 | POST | `/plan/preview` | 预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动） |
 | POST | `/plan/confirm` | 凭据确认：写事务内验签并复核整单，凭据整单仅可用一次 |
 | GET | `/steps`、`/steps/{seq}` | 查询各工序回执与结果 |
-| GET | `/state` | 当前连接图、各构件可达性与最近试载、各支承点检修状态 |
+| GET | `/state` | 当前连接图、各构件可达性与最近试载、各支承点检修状态、连续传力保护对象 |
 | POST | `/snapshots` | 卸撑完成后固化验收快照 |
 | GET | `/snapshots`、`/snapshots/{id}` | 查询快照 |
 | GET | `/supports` `/components` `/replacements` `/connections` `/temp-supports` | 登记簿查询 |
@@ -98,6 +111,10 @@ docker compose up --build
 {"seq": 7, "action": "deactivate_support", "id": "S1"}
 // 检修完成，启用支承点（重新按当前连接检查路径）
 {"seq": 8, "action": "activate_support", "id": "S1"}
+// 列为连续传力保护对象（当前须仅凭在位永久连接抵达在用支承点）
+{"seq": 9, "action": "protect", "component": "C1"}
+// 解除保护（此后该构件回到普通施工期规则）
+{"seq": 10, "action": "unprotect", "component": "C1"}
 ```
 
 ## 可执行调用示例
@@ -319,6 +336,95 @@ curl -X POST $B/plan/preview -d '{"steps":[
 #   → 200 {"ok":true,"token":"planv2-…","steps":[每步预计结果含版本递进],…}
 ```
 
+## 连续传力保护：保护受阻、绕行改接与解除后施工
+
+施工中可把"已在位且当前仅凭在位永久连接即可抵达在用固定支承点"的构件经
+`protect` 工序列为连续传力保护对象，经 `unprotect` 解除；两者都是普通工序，
+占用连续工序号，也可列入预案清单走预演/确认。保护期间不得拆卸该构件；**每道
+后续工序结束时它都须仅凭当时在位的永久连接抵达在用支承点**——即使临时支撑仍能
+承重，拆掉唯一永久路径（连接）或停用唯一在用支承点，都按原有 409 `unreachable`
+语义指出首个受影响构件、整步不留改动。正确顺序是**先接通备用永久路径，再拆
+旧路改接**；其他构件仍按原施工期规则（连接或临时支撑）检查。保护状态持久保存
+（旧库默认无保护对象），`/state` 可查；保护/解除不递增连接版本，但使预案旧凭据
+失效。
+
+一键执行（含断言，请在空库上跑，例如 `docker compose up --build` 后的全新卷）：
+
+```bash
+./demo_protection.sh
+```
+
+逐条手动执行（空库）：
+
+```bash
+B=http://localhost:8080
+
+# 1) 登记：C1 经 J1 落在 S1；J2(S2—C1) 为预登记的备用永久路径；T1(S2—C1) 临时支撑
+curl -X POST $B/supports      -d '{"id":"S1","name":"北柱础"}'
+curl -X POST $B/supports      -d '{"id":"S2","name":"南台基"}'
+curl -X POST $B/components    -d '{"id":"C1","name":"承重梁","min_load":10}'
+curl -X POST $B/connections   -d '{"id":"J1","a":"S1","b":"C1"}'
+curl -X POST $B/connections   -d '{"id":"J2","a":"S2","b":"C1","in_place":false}'
+curl -X POST $B/temp-supports -d '{"id":"T1","a":"S2","b":"C1"}'
+
+# 2) 保护：C1 当前仅凭 J1→S1 永久抵达，列为连续传力保护对象（不改连接版本）
+curl -X POST $B/steps -d '{"seq":1,"action":"protect","component":"C1"}'
+#   → 201 {"seq":1,"action":"protect","result":{"component":"C1","protected":true,"seq":1}}
+curl $B/state
+#   → components 中 C1 "protected":true；顶层 "protections":[{"component":"C1","seq":1,...}]
+#     version 仍为 0（保护不改连接图、不使试载失效）
+
+# 3) 保护受阻：先搭临时支撑 T1，再试图拆掉唯一永久路径 J1——即使 T1 仍承重也拒绝
+curl -X POST $B/steps -d '{"seq":2,"action":"install","target":"temp_support","id":"T1"}'   # 201
+curl -X POST $B/steps -d '{"seq":3,"action":"disassemble","target":"connection","id":"J1"}'
+#   → 409 unreachable
+#     {"error":"unreachable",
+#      "message":"本工序后受保护构件 C1 无法仅凭在位永久连接抵达在用固定支承点（临时支撑不能替代唯一永久路径），整步拒绝",
+#      "first_affected_component":"C1"}
+#   停用唯一在用支承点同样拒绝（T1 经 S2 仍承重也不行）：
+curl -X POST $B/steps -d '{"seq":3,"action":"deactivate_support","id":"S1"}'
+#   → 409 unreachable，first_affected_component=C1
+#   保护期间也不得拆卸构件本身：
+curl -X POST $B/steps -d '{"seq":3,"action":"disassemble","target":"component","id":"C1"}'
+#   → 409 protected，first_affected_component=C1（须先 unprotect）
+#   三次拒绝整步不留改动：无 seq 3 回执，J1 仍在位、S1 仍在用
+curl $B/steps    # 仍只有 seq 1、2
+
+# 4) 绕行改接：先接通备用永久路径 J2，再拆旧路 J1、停用旧支承点 S1
+curl -X POST $B/steps -d '{"seq":3,"action":"install","target":"connection","id":"J2"}'    # 201（v1）
+curl -X POST $B/steps -d '{"seq":4,"action":"disassemble","target":"connection","id":"J1"}'  # 201（v2）
+curl -X POST $B/steps -d '{"seq":5,"action":"deactivate_support","id":"S1"}'                # 201（v3）
+#   C1 全程受保护，且每步后仍仅凭当时在位永久连接抵达（J2→S2），故放行
+curl $B/state    # C1 permanent_reachable=true；S1 active=false；protections 仍含 C1
+
+# 5) 预案逐步反映保护与改接顺序：先拆唯一永久路径的预案失败不落库
+curl -X POST $B/plan/preview -d '{"steps":[{"action":"disassemble","target":"connection","id":"J2"}]}'
+#   → 409 unreachable，failed_step={"index":0,"seq":6,"action":"disassemble"}，不签发凭据
+curl -X POST $B/plan/preview -d '{"steps":[
+  {"action":"activate_support","id":"S1"},
+  {"action":"install","target":"connection","id":"J1"},
+  {"action":"disassemble","target":"connection","id":"J2"}
+]}'
+#   → 200：逐步预演"启用 S1 → 接通 J1 备用永久路径 → 再拆 J2"，成功才签发 token
+#   三步后 resulting.version=6（启用 S1 及装/拆连接各使永久连接版本 +1）
+#   预演不落库；用 token 调 /plan/confirm 后按序落库（写事务内验签并复核整单）
+
+# 6) 保护变更使旧凭据失效：先预演解除保护，再另走 /steps 实际解除，原 token 即 409
+TOKEN=$(curl -s -X POST $B/plan/preview \
+  -d '{"steps":[{"action":"unprotect","component":"C1"}]}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -X POST $B/steps -d '{"seq":9,"action":"unprotect","component":"C1"}'   # 201（保护状态变化）
+curl -X POST $B/plan/confirm -d "{\"steps\":[{\"action\":\"unprotect\",\"component\":\"C1\"}],\"token\":\"$TOKEN\"}"
+#   → 409 plan_stale：保护/工序状态变化使原凭据失效，不写入任何工序
+
+# 7) 解除后施工：C1 回到普通施工期规则，仅剩临时支撑也允许拆永久连接
+curl -X POST $B/steps -d '{"seq":10,"action":"disassemble","target":"connection","id":"J1"}'  # 201
+#   C1 经 T1→S2 仍有施工期支承（reachable=true、permanent_reachable=false）
+#   但无永久路径即卸撑仍按原规则拒绝：
+curl -X POST $B/steps -d '{"seq":11,"action":"remove_support","id":"T1"}'
+#   → 409 support_unreachable，first_affected_component=C1
+```
+
 ## 故障与修复示例：未安装替换件不得充当传力路径
 
 登记固定支承点 `S`、在位承重梁 `C`、**未安装**替换件 `R`，以及 `S—R`、`R—C`
@@ -394,6 +500,9 @@ curl $B/snapshots/1
 | `endpoint_not_in_place` | 端点不在位（附 `first_affected_component`） |
 | `not_in_place` / `already_in_place` | 拆卸/安装对象状态不符 |
 | `already_inactive` / `not_inactive` | 支承点已停用 / 本就在用，停启状态不符 |
+| `already_protected` / `not_protected` | 构件已是 / 不是连续传力保护对象，保护/解除状态不符（附 `first_affected_component`） |
+| `protected` | 连续传力保护期间不得拆卸该构件，须先按工序 `unprotect` 解除（附 `first_affected_component`） |
+| `protect_unreachable` | 构件当前无法仅凭在位永久连接抵达在用支承点（临时支撑不能替代），不能列为保护对象（附 `first_affected_component`） |
 | `support_inactive` | 支承点停用检修中，不得作为新装连接/临时支撑的端点（附 `support`） |
 | `unreachable` | 工序后（含试载、支承点停用时）构件无法经在位连接或临时支撑抵达在用固定支承点 |
 | `support_unreachable` | 卸撑后构件无法仅凭永久连接抵达支承点 |
@@ -414,5 +523,6 @@ demo.sh             # 端到端演示脚本
 demo_uninstalled_replacement.sh  # 未安装替换件虚假路径：故障复现与修复演示
 demo_plan.sh        # 施工预案演示：预演 → 过期拒绝 → 一次写事务确认
 demo_maintenance.sh # 支承点检修演示：停用受阻 → 绕行 → 启用后复验 → 预案停启
+demo_protection.sh  # 连续传力保护演示：保护受阻 → 先接备用永久路径改接 → 解除后施工
 README.md
 ```

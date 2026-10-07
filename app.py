@@ -15,8 +15,17 @@
   数据库中已登记的同类记录同样遵循。
 - 临时支撑 temp_supports：登记后可在位/卸除；不计入"永久连接状态版本"；
   同样要求两端节点实际在位才参与施工期路径判断。
+- 连续传力保护 protections：施工中可将"已在位且当前仅凭在位永久连接即可抵达
+  在用固定支承点"的构件经 protect 工序列为保护对象，之后按 unprotect 工序解除。
+  保护状态持久保存（旧库迁移建空表，默认无保护对象），/state 可查；保护、解除
+  都是普通工序，纳入连续工序号与预案预演/确认。保护期间不得拆卸该构件；每道
+  后续工序结束时它都须仅凭当时在位的永久连接抵达某个在用支承点——即使临时支撑
+  仍能承重，拆掉其唯一永久路径（连接）或停用其唯一在用支承点，仍按原有 409
+  语义指出首个受影响构件、整步不留改动；须先接通备用永久路径（改接）后再拆旧路。
+  保护变更（protect/unprotect）不改连接状态版本、不使试载失效，但纳入预案凭据
+  指纹，旧凭据随之失效。
 - 工序回执 steps：按递增工序号提交 install / disassemble / test_load /
-  remove_support / deactivate_support / activate_support。
+  remove_support / deactivate_support / activate_support / protect / unprotect。
 
 校验规则
 --------
@@ -25,6 +34,13 @@
   在位连接或临时支撑抵达某个在用固定支承点，否则整步回滚并指出首个受影响构件；
   试载同样校验被试构件具备该施工期路径。参与判断的连接必须自身在位且两端
   构件实际在位（见上）。
+- 连续传力保护：protect 要求构件当前在位且仅凭在位永久连接即可抵达在用支承点
+  （临时支撑不能替代，否则 409 protect_unreachable）。保护建立后，每道后续工序
+  结束时受保护构件都须满足更严的"仅凭永久连接可达"；其他构件仍按原施工期规则
+  （连接或临时支撑）检查。按登记序优先指出首个受影响构件：保护对象永久路径被
+  断（拆连接/拆构件/停用支承点，即使临时支撑仍能承重）沿用原有 409 unreachable
+  语义整步拒绝；保护对象本身不得拆卸（409 protected）。unprotect 解除保护后构件
+  回到普通施工期规则。
 - 支承点停用/启用（deactivate_support / activate_support）是普通工序，纳入
   连续工序号，也可列入预案清单。停用后该点退出连接图：搭在它身上的连接、
   临时支撑一并失效，且不得以它为端点新装连接或临时支撑；若停用使某在位构件
@@ -47,8 +63,9 @@
   套用现有传力路径与试载规则——后一步能看到前一步带来的支撑、连接版本与
   试载变化。仅当整单预演成功后，才签发由服务端密钥（持久保存在 SQLite
   meta 表，旧库启动时自动补建）保护的 HMAC 凭据，绑定原清单及预演当时的
-  登记、工序与试载状态；失败指出出错工序及原有错误。无论成败，预演不留下
-  任何改动，凭据也不可能由客户端自行伪造。
+  登记、工序、试载与连续传力保护状态；失败指出出错工序及原有错误。无论成败，
+  预演不留下任何改动，凭据也不可能由客户端自行伪造。protect/unprotect 作为
+  普通工序逐步反映在预演中，保护状态变化会使已签发的旧凭据失效。
 - POST /plan/confirm：在一次写事务内携带原清单与凭据。先以恒定时间比较
   校验 HMAC 凭据：伪造凭据、旧式无密钥摘要、清单改动或预演后登记/工序/
   试载状态变化一律按原有 409 plan_stale 语义拒绝；凭据整单仅可使用一次
@@ -129,6 +146,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE TABLE IF NOT EXISTS plan_consumptions (
     token TEXT PRIMARY KEY,    -- 已用于确认的预案凭据（整单仅可落库一次）
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS protections (
+    -- 连续传力保护对象：一行一个受保护构件；旧库启动建空表，默认无保护对象。
+    -- 由 protect 工序插入、unprotect 工序删除；全程在写事务内随整步/整单提交回滚。
+    component_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    seq INTEGER NOT NULL       -- 建立保护的工序号
 );
 """
 
@@ -302,17 +326,43 @@ def _first_untested(conn, comps, version):
     return None
 
 
-def _check_construction_reachability(conn):
-    """施工中校验：每个在位构件经在位连接或临时支撑抵达固定支承点。"""
+def _protected_ids(conn):
+    """当前连续传力保护对象集合（protections 表；旧库为空表 → 空集）。"""
+    return {r["component_id"] for r in conn.execute(
+        "SELECT component_id FROM protections")}
+
+
+def _check_after_step(conn):
+    """每道工序结束时的统一传力校验（/steps 单步与预案预演/确认共用）。
+
+    - 受保护构件（protections 表）走更严规则：必须仅凭"当时在位的永久连接"抵达
+      某个在用固定支承点，临时支撑不能替代。因此即使临时支撑仍能承重，拆掉其
+      唯一永久路径（连接）或停用其唯一在用支承点，仍按原有 409 unreachable 语义
+      指出首个受影响构件，整步不留改动——须先接通备用永久路径后再改接。
+    - 其他在位构件沿用原施工期规则：经在位连接或临时支撑抵达支承点即可。
+    按构件登记序逐一判定，保证"首个受影响构件"确定且与原语义一致。
+    """
     comps, sups, perm, temp = _graph(conn)
-    seen = _reachable(sups, perm + temp)
-    bad = _first_unreachable(comps, seen)
-    if bad:
-        raise reject(
-            "unreachable",
-            f"本工序后构件 {bad} 无法经在位连接或临时支撑抵达固定支承点，整步拒绝",
-            component=bad,
-        )
+    protected = _protected_ids(conn)
+    seen_perm = _reachable(sups, perm)
+    seen_all = _reachable(sups, perm + temp)
+    for c in comps:
+        if not c["in_place"]:
+            continue
+        if c["id"] in protected:
+            if c["id"] not in seen_perm:
+                raise reject(
+                    "unreachable",
+                    f"本工序后受保护构件 {c['id']} 无法仅凭在位永久连接抵达在用"
+                    "固定支承点（临时支撑不能替代唯一永久路径），整步拒绝",
+                    component=c["id"],
+                )
+        elif c["id"] not in seen_all:
+            raise reject(
+                "unreachable",
+                f"本工序后构件 {c['id']} 无法经在位连接或临时支撑抵达固定支承点，整步拒绝",
+                component=c["id"],
+            )
 
 
 def _get(conn, table, oid, what):
@@ -508,6 +558,15 @@ def _apply_disassemble(conn, body):
         row = _get(conn, "components", oid, "构件")
         if not row["in_place"]:
             raise reject("not_in_place", f"构件 {oid} 不在位，无法拆卸", component=oid)
+        # 连续传力保护期间不得拆卸该构件（须先经 unprotect 工序解除保护）
+        if conn.execute(
+                "SELECT 1 FROM protections WHERE component_id=?", (oid,)).fetchone():
+            raise reject(
+                "protected",
+                f"构件 {oid} 处于连续传力保护期间，不得拆卸，整步拒绝"
+                "（须先按工序 unprotect 解除保护）",
+                component=oid,
+            )
         conn.execute("UPDATE components SET in_place=0 WHERE id=?", (oid,))
         # 联动卸下依附于该构件的在位连接与临时支撑
         jc = [r["id"] for r in conn.execute(
@@ -607,17 +666,61 @@ def _apply_activate_support(conn, body):
     return {"support": oid, "active": True, "version": v}
 
 
+def _apply_protect(conn, seq, body):
+    """建立连续传力保护：构件须已在位，且当前仅凭在位永久连接即可抵达某个
+    在用固定支承点（临时支撑不能替代）。保护状态写入 protections 表并随事务
+    提交/回滚。保护不改连接图，故不递增连接状态版本、不使试载失效。"""
+    cid = body.get("component")
+    row = _get(conn, "components", cid, "构件")
+    if not row["in_place"]:
+        raise reject(
+            "endpoint_not_in_place",
+            f"构件 {cid} 当前不在位，不能列为连续传力保护对象，整步拒绝",
+            component=cid,
+        )
+    exists = conn.execute(
+        "SELECT 1 FROM protections WHERE component_id=?", (cid,)).fetchone()
+    if exists is not None:
+        raise reject("already_protected", f"构件 {cid} 已是连续传力保护对象", component=cid)
+    comps, sups, perm, _temp = _graph(conn)
+    seen = _reachable(sups, perm)
+    if cid not in seen:
+        raise reject(
+            "protect_unreachable",
+            f"构件 {cid} 当前无法仅凭在位永久连接抵达在用固定支承点"
+            "（临时支撑不能替代），不能列为连续传力保护对象，整步拒绝",
+            component=cid,
+        )
+    conn.execute(
+        "INSERT INTO protections(component_id, created_at, seq) VALUES(?,?,?)",
+        (cid, now(), seq))
+    return {"component": cid, "protected": True, "seq": seq}
+
+
+def _apply_unprotect(conn, body):
+    """解除连续传力保护：构件此前须经 protect 工序受保护。解除后该构件回到普通
+    施工期规则（连接或临时支撑可达即可，由本步后的统一校验执行）。"""
+    cid = body.get("component")
+    row = _get(conn, "components", cid, "构件")
+    exists = conn.execute(
+        "SELECT 1 FROM protections WHERE component_id=?", (cid,)).fetchone()
+    if exists is None:
+        raise reject("not_protected", f"构件 {cid} 当前不是连续传力保护对象", component=cid)
+    conn.execute("DELETE FROM protections WHERE component_id=?", (cid,))
+    return {"component": cid, "protected": False}
+
+
 # 工序动作全集：/steps 单步与预案清单共用同一套校验
 _ACTIONS = ("install", "disassemble", "test_load", "remove_support",
-            "deactivate_support", "activate_support")
+            "deactivate_support", "activate_support", "protect", "unprotect")
 
 
 def _apply_action(conn, seq, action, body):
     """按动作套用单步工序并返回执行结果。
 
-    装/拆改变连接图，试载也必须作用于当前经在位连接或临时支承可达的构件，
-    支承点停/启同样改变传力路径，因此这些工序套用后重建连接图做施工中校验
-    （卸撑在自身函数内做更严校验）。
+    所有工序套用后统一重建连接图做 _check_after_step：受保护构件须仅凭在位
+    永久连接抵达在用支承点，其他构件经在位连接或临时支撑可达；卸撑另在自身
+    函数内做更严的永久路径 + 当前版本合格试载校验。
     """
     if action == "install":
         result = _apply_install(conn, body)
@@ -629,11 +732,13 @@ def _apply_action(conn, seq, action, body):
         result = _apply_deactivate_support(conn, body)
     elif action == "activate_support":
         result = _apply_activate_support(conn, body)
+    elif action == "protect":
+        result = _apply_protect(conn, seq, body)
+    elif action == "unprotect":
+        result = _apply_unprotect(conn, body)
     else:
         result = _apply_remove_support(conn, body)
-    if action in ("install", "disassemble", "test_load",
-                  "deactivate_support", "activate_support"):
-        _check_construction_reachability(conn)
+    _check_after_step(conn)
     return result
 
 
@@ -732,11 +837,12 @@ def _table_fingerprint(conn, sql):
 
 
 def _plan_token(conn, items):
-    """确认凭据：以服务端持久密钥对"清单 + 当前登记/工序状态"做 HMAC-SHA256。
+    """确认凭据：以服务端持久密钥对"清单 + 当前登记/工序/保护状态"做 HMAC-SHA256。
 
-    绑定清单、当前登记（支承点/构件/连接/临时支撑）与工序状态（连接状态
-    版本、工序回执、试载记录）。密钥永不下发，客户端无法自行伪造；清单或
-    任一状态变化都会使重算结果不符。仅 /plan/preview 整单预演成功后签发。
+    绑定清单、当前登记（支承点/构件/连接/临时支撑）、工序状态（连接状态
+    版本、工序回执、试载记录）与连续传力保护状态（protections）。密钥永不
+    下发，客户端无法自行伪造；清单或任一状态变化（含 protect/unprotect）都会使
+    重算结果不符。仅 /plan/preview 整单预演成功后签发。
     """
     list_fp = hashlib.sha256(json.dumps(
         items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -747,6 +853,7 @@ def _plan_token(conn, items):
         _table_fingerprint(conn, "SELECT * FROM temp_supports ORDER BY rowid"),
         _table_fingerprint(conn, "SELECT * FROM steps ORDER BY seq"),
         _table_fingerprint(conn, "SELECT * FROM test_loads ORDER BY id"),
+        _table_fingerprint(conn, "SELECT * FROM protections ORDER BY rowid"),
         str(_version(conn)),
     ]).encode("utf-8")).hexdigest()
     mac = hmac.new(
@@ -903,6 +1010,7 @@ def create_snapshot(_body):
             "supports": sups,
             "components": comp_list,
             "connections_in_place": joints,
+            "protections": sorted(_protected_ids(conn)),
             "steps": receipts,
         }
         created = now()
@@ -972,6 +1080,7 @@ def get_state():
     try:
         comps, sups, perm, temp = _graph(conn)
         v = _version(conn)
+        protected = _protected_ids(conn)
         seen_all = _reachable(sups, perm + temp)
         seen_perm = _reachable(sups, perm)
         comp_list = []
@@ -984,6 +1093,7 @@ def get_state():
             comp_list.append({
                 "id": c["id"], "name": c["name"], "min_load": c["min_load"],
                 "origin": c["origin"], "in_place": bool(c["in_place"]),
+                "protected": c["id"] in protected,
                 "reachable": c["id"] in seen_all if c["in_place"] else None,
                 "permanent_reachable": c["id"] in seen_perm if c["in_place"] else None,
                 "last_test": dict(t) if t else None,
@@ -995,6 +1105,11 @@ def get_state():
         # 各支承点检修状态：active=false 为停用检修中（不参与传力路径）
         sups_detail = [dict(r, active=bool(r["active"])) for r in conn.execute(
             "SELECT id, name, active FROM supports ORDER BY rowid")]
+        # 连续传力保护对象（旧库为空）：附建立工序号；保护期间须仅凭永久连接抵达支承点
+        prot = [{"component": r["component_id"], "seq": r["seq"],
+                 "created_at": r["created_at"]}
+                for r in conn.execute(
+                    "SELECT component_id, seq, created_at FROM protections ORDER BY rowid")]
         last = conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM steps").fetchone()["s"]
         return 200, {
             "version": v,
@@ -1004,6 +1119,7 @@ def get_state():
             "components": comp_list,
             "connections": joints,
             "temp_supports": shores,
+            "protections": prot,
         }
     finally:
         conn.close()
@@ -1046,7 +1162,7 @@ def route(method, path, body):
                 "POST /connections         登记榫卯连接（允许的端点组合）",
                 "POST /temp-supports       登记临时支撑",
                 "POST /replacements        登记替换件",
-                "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑/支承点停启回执",
+                "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑/支承点停启/保护解除回执",
                 "POST /plan/preview         预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动）",
                 "POST /plan/confirm         凭据确认：写事务内验签并复核整单，凭据整单仅可用一次",
                 "GET  /steps | /steps/{n}  查询各工序回执与结果",
